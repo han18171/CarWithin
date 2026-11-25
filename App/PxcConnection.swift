@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// 春风 CFMOTO 仪表（MotoPlay / EasyConn / PXC）会话。
@@ -41,6 +42,10 @@ final class PxcConnection: @unchecked Sendable {
 
     private let localIP: String
     private let targetIP: String
+    /// 实际用于探测/回连过滤的仪表地址。探测失败时会被网段扫描结果替换。
+    private var dashboardIP: String
+    /// 实际使用的探测端口。默认 10930；扫描到其他端口时随之更新。
+    private var probePort: UInt16
     private let phone: TailingPhoneInfo
     private let dashboard: String
     private let identityProvider: () throws -> TailingIdentity
@@ -64,6 +69,8 @@ final class PxcConnection: @unchecked Sendable {
          log: @escaping (String) -> Void) {
         self.localIP = localIP
         self.targetIP = targetIP
+        self.dashboardIP = targetIP
+        self.probePort = Port.probe
         self.phone = phone
         self.dashboard = dashboard
         self.identityProvider = identityProvider
@@ -110,7 +117,7 @@ final class PxcConnection: @unchecked Sendable {
         }
         log("\(dashboard) TCP 已监听 \(localIP):\(Port.control)/\(Port.media)/\(Port.video)，正在探测仪表")
 
-        try probe()
+        try probeOrDiscover()
 
         let deadline = Date().addingTimeInterval(20)
         condition.lock()
@@ -130,7 +137,7 @@ final class PxcConnection: @unchecked Sendable {
             do {
                 let socket = try TailingSocket.create()
                 defer { socket.close() }
-                try socket.connect(localIP: localIP, remoteIP: targetIP, port: Port.probe, timeout: 3)
+                try socket.connect(localIP: localIP, remoteIP: dashboardIP, port: probePort, timeout: 3)
                 let body = try TailingProtocol.json(["phoneType": "Android", "packageName": phone.package])
                 try socket.write(TailingProtocol.control(Command.probe, payload: body))
                 let reply = try TailingProtocol.readControl { try socket.readExactly($0, timeout: 4) }
@@ -143,9 +150,12 @@ final class PxcConnection: @unchecked Sendable {
                 return
             } catch {
                 lastError = error
-                log("\(dashboard) 探测仪表\(targetIP):\(Port.probe) 第 \(attempt) 次失败：\(error.localizedDescription)")
+                log("\(dashboard) 探测仪表\(dashboardIP):\(probePort) 第 \(attempt) 次失败：\(error.localizedDescription)")
                 if let tailing = error as? TailingError, case .system(_, let code) = tailing, code == EPERM {
                     log("系统拒绝访问局域网（EPERM）。请到 iPhone「设置 → 隐私与安全性 → 本地网络」把 CarWithin 打开后重试。")
+                }
+                if let tailing = error as? TailingError, case .system(_, let code) = tailing, code == ECONNREFUSED {
+                    log("\(dashboardIP):\(probePort) 主动拒绝连接（ECONNREFUSED）：该主机在线但没有服务监听这个端口。")
                 }
                 if attempt < 4 { Thread.sleep(forTimeInterval: 1.2) }
             }
@@ -153,13 +163,83 @@ final class PxcConnection: @unchecked Sendable {
         throw lastError ?? TailingError.timeout("探测仪表")
     }
 
+    // MARK: - 地址发现
+
+    /// 首选地址不通时，扫描同网段的 PXC 端口，找到真正在监听的主机再探测。
+    /// 春风 150SC-F 实测 192.168.0.1:10930 返回 ECONNREFUSED：网关在线，但仪表服务不在这个地址/端口上。
+    private func probeOrDiscover() throws {
+        var firstError: Error?
+        do {
+            try probe()
+            return
+        } catch {
+            firstError = error
+        }
+        let reason = firstError?.localizedDescription ?? "-"
+        log("\(dashboard) 首选 \(dashboardIP):\(probePort) 探测失败：\(reason)")
+
+        guard let prefix = Self.subnetPrefix(localIP) else { throw firstError ?? TailingError.timeout("探测仪表") }
+        let ports = (0...4).map { UInt16(Int(Port.probe) + $0) }
+        log("\(dashboard) 扫描 \(prefix).1-254 的端口 \(ports.map(String.init).joined(separator: "/"))，请让仪表停在「手机互联」页面")
+        let found = scan(prefix: prefix, localIP: localIP, ports: ports)
+        guard !found.isEmpty else {
+            log("\(dashboard) 扫描结束：同网段没有任何主机在 \(ports.first!)-\(ports.last!) 端口监听。")
+            log("\(dashboard) 请确认手机连的是仪表自己的热点，且仪表已进入手机互联页面。")
+            throw firstError ?? TailingError.timeout("探测仪表")
+        }
+        log("\(dashboard) 扫描发现 \(found.count) 个可连接端点：\(found.map { "\($0.0):\($0.1)" }.joined(separator: "、"))")
+        for (ip, port) in found {
+            dashboardIP = ip
+            probePort = port
+            log("\(dashboard) 改用 \(ip):\(port) 重试探测")
+            if (try? probe()) != nil {
+                log("\(dashboard) 探测成功，本次使用 \(ip):\(port)")
+                return
+            }
+        }
+        log("\(dashboard) 所有发现的端点都未接受投屏探测")
+        throw firstError ?? TailingError.timeout("探测仪表")
+    }
+
+    private static func subnetPrefix(_ ip: String) -> String? {
+        let parts = ip.split(separator: ".")
+        guard parts.count == 4 else { return nil }
+        return parts[0...2].joined(separator: ".")
+    }
+
+    /// 并发做 TCP 连接探测：同一主机命中一个端口即停止。
+    private func scan(prefix: String, localIP: String, ports: [UInt16]) -> [(String, UInt16)] {
+        let box = CTScanHits()
+        let semaphore = DispatchSemaphore(value: 24)
+        DispatchQueue.concurrentPerform(iterations: 254) { index in
+            let ip = "\(prefix).\(index + 1)"
+            guard ip != localIP else { return }
+            for port in ports {
+                semaphore.wait()
+                defer { semaphore.signal() }
+                guard let socket = try? TailingSocket.create() else { continue }
+                let reachable = (try? socket.connect(localIP: localIP, remoteIP: ip, port: port, timeout: 0.35)) != nil
+                socket.close()
+                if reachable {
+                    box.add(ip, port)
+                    return
+                }
+            }
+        }
+        return box.sorted { Self.lastOctet($0.0) < Self.lastOctet($1.0) }
+    }
+
+    private static func lastOctet(_ ip: String) -> Int {
+        Int(ip.split(separator: ".").last.map(String.init) ?? "") ?? 0
+    }
+
     // MARK: - 反向连接
 
     private func accept(_ server: TailingSocket, port: UInt16) {
         do {
             while true {
-                let socket = try tracked(server.accept(remoteIP: targetIP))
-                log("\(dashboard) ★ 仪表回连 TCP\(port)（来自 \(targetIP)）")
+                let socket = try tracked(server.accept(remoteIP: dashboardIP))
+                log("\(dashboard) ★ 仪表回连 TCP\(port)（来自 \(dashboardIP)）")
                 if port == Port.video {
                     condition.lock()
                     if video == nil && !closed { video = socket; condition.broadcast() }
@@ -416,5 +496,20 @@ final class PxcConnection: @unchecked Sendable {
         condition.broadcast()
         condition.unlock()
         sockets.forEach { $0.close() }
+    }
+}
+
+/// 扫描结果收集器（供 concurrentPerform 并发写入）。
+private final class CTScanHits: @unchecked Sendable {
+    private var items: [(String, UInt16)] = []
+    private let lock = NSLock()
+
+    func add(_ ip: String, _ port: UInt16) {
+        lock.lock(); items.append((ip, port)); lock.unlock()
+    }
+
+    func sorted(by areInIncreasingOrder: ((String, UInt16), (String, UInt16)) -> Bool) -> [(String, UInt16)] {
+        lock.lock(); defer { lock.unlock() }
+        return items.sorted(by: areInIncreasingOrder)
     }
 }
