@@ -1,4 +1,6 @@
 import Foundation
+import MediaPlayer
+import UIKit
 
 /// Buttons CarWithin can press on the iPhone's behalf. Raw values are the browser message names.
 enum CarPlayControl: String, CaseIterable {
@@ -71,4 +73,70 @@ struct TouchSlots {
 
     var isEmpty: Bool { slots.allSatisfy { $0 == nil } }
     mutating func reset() { slots = Array(repeating: nil, count: slots.count) }
+}
+
+/// 把蓝牙/车把媒体键（AVRCP 播放、暂停、上一曲、下一曲）转成 CarPlay HID 注入。
+/// 默认只在春风仪表输出期间接管，避免抢占其他场景的 now-playing。
+/// 原理：iPhone 把 AVRCP 命令派给当前 now-playing App，所以先声明 now-playing 再转发。
+final class MediaKeyBridge {
+    static let shared = MediaKeyBridge()
+
+    private var tokens: [(command: MPRemoteCommand, token: Any)] = []
+    private(set) var isRunning = false
+    var onControl: ((CarPlayControl) -> Void)?
+    var onLog: ((String) -> Void)?
+
+    func start() {
+        guard !isRunning else { return }
+        isRunning = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isRunning else { return }
+            let center = MPRemoteCommandCenter.shared()
+            self.install(center.playCommand, "播放", .playPause)
+            self.install(center.pauseCommand, "暂停", .playPause)
+            self.install(center.togglePlayPauseCommand, "播放/暂停", .playPause)
+            self.install(center.nextTrackCommand, "下一曲", .next)
+            self.install(center.previousTrackCommand, "上一曲", .previous)
+            self.claimNowPlaying()
+            UIApplication.shared.beginReceivingRemoteControlEvents()
+            self.onLog?("蓝牙媒体键已接管：按车把上的播放/切歌键会直接控制 CarPlay")
+        }
+    }
+
+    func stop() {
+        guard isRunning else { return }
+        isRunning = false
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.tokens.forEach { $0.command.removeTarget($0.token) }
+            self.tokens.removeAll()
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            if #available(iOS 13.0, *) { MPNowPlayingInfoCenter.default().playbackState = .stopped }
+            UIApplication.shared.endReceivingRemoteControlEvents()
+            self.onLog?("蓝牙媒体键接管已停止")
+        }
+    }
+
+    private func install(_ command: MPRemoteCommand, _ name: String, _ control: CarPlayControl) {
+        command.isEnabled = true
+        let token = command.addTarget { [weak self] _ in
+            self?.onLog?("收到蓝牙媒体键：\(name) → 注入 CarPlay「\(control.title)」")
+            self?.onControl?(control)
+            return .success
+        }
+        tokens.append((command, token))
+    }
+
+    private func claimNowPlaying() {
+        var info: [String: Any] = [
+            MPMediaItemPropertyTitle: "CarWithin",
+            MPMediaItemPropertyArtist: "CarPlay",
+            MPMediaItemPropertyPlaybackDuration: 0,
+            MPNowPlayingInfoPropertyIsLiveStream: true,
+            MPNowPlayingInfoPropertyPlaybackRate: 1.0
+        ]
+        info[MPMediaItemPropertyAlbumTitle] = "仪表投屏"
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        if #available(iOS 13.0, *) { MPNowPlayingInfoCenter.default().playbackState = .playing }
+    }
 }
