@@ -146,6 +146,9 @@ final class NativeReceiver {
                              onState: { [weak self] in self?.onCfmotoState?($0) },
                              onLog: { [weak self] in self?.log($0) },
                              requestKeyframe: { [weak self] in self?.requestKeyFrame(reason: "春风解码恢复") })
+                MediaKeyBridge.shared.onLog = { [weak self] in self?.log($0) }
+                MediaKeyBridge.shared.onControl = { [weak self] in self?.press($0) }
+                MediaKeyBridge.shared.start()
             }
             if let target = configuration.ninebotAddress {
                 self.ninebot.start(localAddress: configuration.address, targetAddress: target, mode: configuration.ninebotMode,
@@ -370,6 +373,7 @@ final class NativeReceiver {
         ninebot.stop()
         cfmoto5.stop()
         cfmoto62.stop()
+        MediaKeyBridge.shared.stop()
         tailing.stop()
         carLink.stop()
         #if DEBUG
