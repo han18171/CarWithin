@@ -130,8 +130,10 @@ jobs:
           lipo -info "$APP/TDSCarKit"
 
           echo "--- 春风代码特征（二进制字节计数）---"
-          python3 -c "import sys;d=open(sys.argv[1],'rb').read();ts=[b'easy_conn',b'HUName',b'pxcVersion',b'CFMOTO'];c=[d.count(t) for t in ts];print('  '+' | '.join(t.decode()+'='+str(n) for t,n in zip(ts,c)));sys.exit(0 if sum(c)>0 else 1)" "$APP/TDSCarKit" || {
-            echo "::error::二进制里找不到任何春风/PXC 特征串，这份包没有春风输出"
+          # 注意：Swift 会把 ≤15 字节的短字符串内联进指令，文件里没有连续 ASCII，
+          # 所以不能用 easy_conn / pxcVersion 这类短串判断；改用类型元数据和长字面量。
+          python3 -c "import sys;d=open(sys.argv[1],'rb').read();ks=[b'CfmotoOutput',b'CfmotoProfile',b'PxcConnection',b'appVersionFingerPrint'];h={k.decode():d.count(k) for k in ks};print('  '+', '.join(k+'='+str(v) for k,v in h.items()));sys.exit(0 if all(v>0 for v in h.values()) else 1)" "$APP/TDSCarKit" || {
+            echo "::error::二进制里缺少春风代码特征，这份包没有春风输出"
             exit 1
           }
           echo "  ✓ 春风 PXC 代码已编入"
