@@ -75,7 +75,7 @@ struct TouchSlots {
     mutating func reset() { slots = Array(repeating: nil, count: slots.count) }
 }
 
-/// 把蓝牙/车把媒体键（AVRCP 播放、暂停、上一曲、下一曲）转成 CarPlay HID 注入。
+/// 把车把蓝牙媒体键（AVRCP）重映射成 CarPlay 焦点导航 HID 注入。
 /// 默认只在春风仪表输出期间接管，避免抢占其他场景的 now-playing。
 /// 原理：iPhone 把 AVRCP 命令派给当前 now-playing App，所以先声明 now-playing 再转发。
 final class MediaKeyBridge {
@@ -92,14 +92,21 @@ final class MediaKeyBridge {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.isRunning else { return }
             let center = MPRemoteCommandCenter.shared()
-            self.install(center.playCommand, "播放", .playPause)
-            self.install(center.pauseCommand, "暂停", .playPause)
-            self.install(center.togglePlayPauseCommand, "播放/暂停", .playPause)
-            self.install(center.nextTrackCommand, "下一曲", .next)
-            self.install(center.previousTrackCommand, "上一曲", .previous)
+            // 车把媒体键重映射成 CarPlay 焦点导航：
+            // 上一曲 = 焦点上移，下一曲 = 焦点下移，播放/暂停 = 确认，长按上一曲 = 主页，长按下一曲 = 返回。
+            self.install(center.previousTrackCommand, "上一曲键", .knobPrevious)
+            self.install(center.nextTrackCommand, "下一曲键", .knobNext)
+            self.install(center.playCommand, "播放键", .select)
+            self.install(center.pauseCommand, "暂停键", .select)
+            self.install(center.togglePlayPauseCommand, "播放/暂停键", .select)
+            self.install(center.seekBackwardCommand, "长按上一曲", .home)
+            self.install(center.seekForwardCommand, "长按下一曲", .back)
+            self.install(center.skipBackwardCommand, "快退键", nil)
+            self.install(center.skipForwardCommand, "快进键", nil)
+            self.install(center.changePlaybackPositionCommand, "进度拖动", nil)
             self.claimNowPlaying()
             UIApplication.shared.beginReceivingRemoteControlEvents()
-            self.onLog?("蓝牙媒体键已接管：按车把上的播放/切歌键会直接控制 CarPlay")
+            self.onLog?("车把按键已接管：上一曲/下一曲 = 移动焦点，播放暂停 = 确认，音量键仍调系统音量")
         }
     }
 
@@ -117,11 +124,16 @@ final class MediaKeyBridge {
         }
     }
 
-    private func install(_ command: MPRemoteCommand, _ name: String, _ control: CarPlayControl) {
+    private func install(_ command: MPRemoteCommand, _ name: String, _ control: CarPlayControl?) {
         command.isEnabled = true
         let token = command.addTarget { [weak self] _ in
-            self?.onLog?("收到蓝牙媒体键：\(name) → 注入 CarPlay「\(control.title)」")
-            self?.onControl?(control)
+            guard let self else { return .success }
+            if let control {
+                self.onLog?("收到车把按键：\(name) → 注入 CarPlay「\(control.title)」")
+                self.onControl?(control)
+            } else {
+                self.onLog?("收到车把按键：\(name)（暂未映射）")
+            }
             return .success
         }
         tokens.append((command, token))
