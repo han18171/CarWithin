@@ -1,0 +1,11 @@
+name: smoke-macos
+on:
+  workflow_dispatch:
+jobs:
+  hello:
+    runs-on: macos-14
+    steps:
+      - name: echo
+        run: |
+          sw_vers
+          xcodebuild -version
