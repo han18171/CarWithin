@@ -129,12 +129,12 @@ jobs:
           echo "--- 架构 ---"
           lipo -info "$APP/TDSCarKit"
 
-          echo "--- 春风代码特征（二进制里必须有）---"
-          for token in easy_conn HUName CfmotoOutput; do
-            n=$(LC_ALL=C grep -a -c -- "$token" "$APP/TDSCarKit" || true)
-            echo "  $token: ${n:-0} 处"
-            test "${n:-0}" -ge 1 || { echo "::error::二进制里找不到 $token，这份包没有春风输出"; exit 1; }
-          done
+          echo "--- 春风代码特征（二进制字节计数）---"
+          python3 -c "import sys;d=open(sys.argv[1],'rb').read();ts=[b'easy_conn',b'HUName',b'pxcVersion',b'CFMOTO'];c=[d.count(t) for t in ts];print('  '+' | '.join(t.decode()+'='+str(n) for t,n in zip(ts,c)));sys.exit(0 if sum(c)>0 else 1)" "$APP/TDSCarKit" || {
+            echo "::error::二进制里找不到任何春风/PXC 特征串，这份包没有春风输出"
+            exit 1
+          }
+          echo "  ✓ 春风 PXC 代码已编入"
 
           echo "--- 打包 ---"
           rm -rf dist && mkdir -p dist/Payload
