@@ -13,7 +13,7 @@ struct CfmotoProfile: Equatable {
     let label: String
 
     static let fiveInch = CfmotoProfile(width: 800, height: 386, fps: 30, bitrate: 3_500_000, label: "春风 5 寸")
-    static let sixInch = CfmotoProfile(width: 1024, height: 515, fps: 30, bitrate: 4_500_000, label: "春风 6.2 寸")
+    static let sixInch = CfmotoProfile(width: 1024, height: 515, fps: 60, bitrate: 6_500_000, label: "春风 6.2 寸")
 
     var encodeWidth: Int { width - width % 2 }
     var encodeHeight: Int { height % 2 == 0 ? height : height + 1 }
@@ -114,6 +114,18 @@ final class CfmotoOutput {
                     report("仪表已连接，等待 CarPlay 画面…")
                     var first = true
                     var nextFrame = ProcessInfo.processInfo.systemUptime
+                    // 仪表按自己的节奏逐帧「拉」，这里只决定上限；同时统计真实出帧率。
+                    var fpsWindowStart = ProcessInfo.processInfo.systemUptime
+                    var fpsWindowFrames = 0
+                    func countFrame() {
+                        fpsWindowFrames += 1
+                        let now = ProcessInfo.processInfo.systemUptime
+                        guard now - fpsWindowStart >= 2 else { return }
+                        let measured = Double(fpsWindowFrames) / (now - fpsWindowStart)
+                        onLog(String(format: "%@实测 %.1f fps（\(profile.fps) fps 上限）", profile.label, measured))
+                        fpsWindowStart = now
+                        fpsWindowFrames = 0
+                    }
                     while active {
                         try connection.checkHealth()
                         let ready = queue.sync { latest != nil }
@@ -139,11 +151,13 @@ final class CfmotoOutput {
                             }
                             guard let recovered else { throw TailingError.timeout("等待 H.264 编码画面") }
                             try connection.sendH264(recovered.data)
+                            countFrame()
                             first = false
                             report("正在投屏 · \(profile.title) · H.264")
                             continue
                         }
                         try connection.sendH264(result.data)
+                        countFrame()
                         first = false
                         report("正在投屏 · \(profile.title) · H.264")
                     }
